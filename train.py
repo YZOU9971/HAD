@@ -30,6 +30,7 @@ WORK_DIR = 'checkpoints'
 
 def get_dataloader(args, BATCH_SIZE):
     train_set = get_dataset('NTU120', 'train', args)
+    # train_set = get_dataset('PKUMMD', 'train', args)
     # train_set = get_dataset('NUCLA', 'train', args)
     train_loader = DataLoader(
         train_set,
