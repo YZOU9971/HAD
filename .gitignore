@@ -1,0 +1,27 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# pytorch / checkpoints
+*.pt
+*.pth
+checkpoints/
+runs/
+logs/
+
+# dataset
+datasets/
+
+# IDE
+.idea/
+
+# system
+.DS_Store
+
+# large outputs
+*.mp4
+*.avi
+*.pkl
+*.npy
+*.npz

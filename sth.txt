@@ -1,0 +1,4 @@
+unzip_data.py                   原始下载后的数据集解压放入对应文件夹，skeleton额外处理
+preprocess_data_NTURGBD.py      生成meta文件，同时.skeleton转存为一个.npy
+preprocess_data_NUCLA.py        生成meta文件，3D pose有缺损
+
