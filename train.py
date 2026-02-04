@@ -98,7 +98,6 @@ def build_inputs_from_batch(batch, device, modalities):
 
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
-    print("1")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     modalities = args['modalities']
 
@@ -164,6 +163,7 @@ def main():
                         log_str += f" | {m}: {loss_dict[m]:.4f}"
 
                 print(log_str)
+                solver.flush_step()
 
         scheduler.step()
         avg_loss = total_loss / max(1, len(train_loader))

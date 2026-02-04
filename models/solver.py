@@ -6,23 +6,12 @@ from models.GMDtools import GMD
 
 class Solver:
     def __init__(self, model, optimizer, mode='base', lambda_spec=1.0, lambda_orth=0.1, accum_steps=1):
-        """
-        mode:
-            'base': Joint training (L_shared + L_spec)
-            'DGL' : Detached Gradient Learning (Fusion detached)
-            'GMD' : Gradient Modulation (PCGrad style between Shared vs Spec)
-            'GGR' : Gradient-Guided Routing (The Proposed Method - Orthogonalization)
-
-        lambda_orth: Weight for Feature Orthogonality Loss
-        accum: Gradient accumulation steps
-        """
         self.model = model
-        self.mode = mode
-        self.lambda_spec = lambda_spec
-        self.lambda_orth = lambda_orth
-        self.accum_steps = accum_steps
+        self.mode = str(mode).upper()  # normalize
+        self.lambda_spec = float(lambda_spec)
+        self.lambda_orth = float(lambda_orth)
+        self.accum_steps = int(accum_steps)
         self.criterion = nn.CrossEntropyLoss()
-
         self.step_count = 0
 
         if self.mode == 'GMD':
@@ -30,91 +19,123 @@ class Solver:
         else:
             self.optimizer = optimizer
 
-        print(f"Solver initialized in mode: [{self.mode.upper()}] | Accumulation: {self.accum_steps}")
+        print(f"Solver initialized in mode: [{self.mode}] | Accumulation: {self.accum_steps}")
+
+    def _unwrap_model(self):
+        return self.model.module if hasattr(self.model, 'module') else self.model
+
+    def _build_inputs_from_batch(self, batch, device):
+        """
+        Compatible with UnifyModel forward kwargs: x_rgb/x_ir/x_depth/x_pose.
+        Uses model.modalities to decide which keys are needed.
+        """
+        _m = self._unwrap_model()
+        modalities = getattr(_m, 'modalities', ('rgb', 'ir', 'depth', 'pose'))
+
+        key_map = {'rgb': 'x_rgb', 'ir': 'x_ir', 'depth': 'x_depth', 'pose': 'x_pose'}
+        inputs = {}
+
+        for mod in modalities:
+            if mod not in batch:
+                raise KeyError(f"Batch missing modality '{mod}'. Available keys: {list(batch.keys())}")
+            inputs[key_map[mod]] = batch[mod].to(device, non_blocking=True)
+
+        return inputs, modalities
 
     def train_step(self, batch, device):
-        """
-        Execute one training iteration.
-        """
-        # 1. Prepare Data
-        x_rgb, x_ir, x_depth, x_pose = batch['rgb'].to(device), batch['ir'].to(device), batch['depth'].to(device), batch['pose'].to(device)
-        targets = batch['label'].to(device)
+        inputs, modalities = self._build_inputs_from_batch(batch, device)
+        targets = batch['label'].to(device, non_blocking=True)
 
         self.step_count += 1
         is_update_step = (self.step_count % self.accum_steps == 0)
 
         # Mode: GGR
         if self.mode == 'GGR':
-            # 1. Forward
-            logits_shared, logits_spec = self.model(x_rgb, x_ir, x_depth, x_pose, gradient_control='GGR')
-            # 2. Compute Losses
+            logits_shared, logits_spec = self.model(**inputs, gradient_control='GGR')
+
             l_shared = self.criterion(logits_shared, targets)
             l_specs = {k: self.criterion(v, targets) for k, v in logits_spec.items()}
 
             loss_dict = {'shared': l_shared.item()}
             loss_dict.update({k: v.item() for k, v in l_specs.items()})
 
+            # scale for gradient accumulation
             l_shared_scaled = l_shared / self.accum_steps
             l_specs_scaled = {k: v / self.accum_steps for k, v in l_specs.items()}
 
+            # (1) Backprop SPEC first (anchor gradients stored in z.grad)
             total_spec_loss = sum(l_specs_scaled.values()) * self.lambda_spec
             total_spec_loss.backward(retain_graph=True)
 
+            # (2) Apply asymmetric routing to shared gradients (feature-level)
             self._apply_asymmetric_ggr(l_shared_scaled)
 
+            # (3) Correlation penalty between z_shared and modality features (named orth in your code)
+            _model = self._unwrap_model()
             l_orth = torch.tensor(0.0, device=device)
-            _model = self.model.module if hasattr(self.model, 'module') else self.model
 
             if hasattr(_model, 'z_shared') and hasattr(_model, 'features'):
                 z_s = _model.z_shared
                 for z_p in _model.features.values():
-                    l_orth += F.cosine_similarity(z_s, z_p, dim=1).abs().mean()
+                    l_orth = l_orth + F.cosine_similarity(z_s, z_p, dim=1).abs().mean()
 
             loss_dict['orth'] = l_orth.item()
             (l_orth * self.lambda_orth / self.accum_steps).backward()
 
             if is_update_step:
                 self.optimizer.step()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
             total_loss_val = l_shared + sum(l_specs.values()) * self.lambda_spec
             return total_loss_val.item(), loss_dict
 
+        # base / DGL / GMD
+        ctrl = 'base'
+        if self.mode == 'DGL':
+            ctrl = 'DGL'
+        elif self.mode == 'GMD':
+            ctrl = 'GMD'
+
+        logits_shared, logits_spec = self.model(**inputs, gradient_control=ctrl.lower() if ctrl == 'base' else ctrl)
+
+        l_shared = self.criterion(logits_shared, targets)
+        l_specs_dict = {k: self.criterion(v, targets) for k, v in logits_spec.items()}
+        l_spec_sum = sum(l_specs_dict.values())
+
+        loss_dict = {'shared': l_shared.item()}
+        loss_dict.update({k: v.item() for k, v in l_specs_dict.items()})
+
+        if self.mode == 'GMD':
+            objectives = [
+                l_shared / self.accum_steps,
+                (l_spec_sum * self.lambda_spec) / self.accum_steps
+            ]
+            self.optimizer.pc_backward(objectives)
+            total_loss_val = l_shared + l_spec_sum * self.lambda_spec
         else:
-            ctrl = 'DGL' if self.mode == 'DGL' else ('GMD' if self.mode == 'GMD' else 'base')
-            logits_shared, logits_spec = self.model(x_rgb, x_ir, x_depth, x_pose, gradient_control=ctrl)
+            total_loss = l_shared + self.lambda_spec * l_spec_sum
+            (total_loss / self.accum_steps).backward()
+            total_loss_val = total_loss
 
-            l_shared = self.criterion(logits_shared, targets)
-            l_specs_dict = {k: self.criterion(v, targets) for k, v in logits_spec.items()}
-            l_spec_sum = sum(l_specs_dict.values())
+        if is_update_step:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
 
-            loss_dict = {'shared': l_shared.item()}
-            loss_dict.update({k: v.item() for k, v in l_specs_dict.items()})
+        return total_loss_val.item(), loss_dict
 
-            if self.mode == 'GMD':
-                objectives = [l_shared / self.accum_steps, l_spec_sum * self.lambda_spec / self.accum_steps]
-                self.optimizer.pc_backward(objectives)
-                total_loss_val = l_shared + l_spec_sum * self.lambda_spec
-            else:
-                total_loss = l_shared + self.lambda_spec * l_spec_sum
-                (total_loss / self.accum_steps).backward()
-                total_loss_val = total_loss
-
-            if is_update_step:
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
-            return total_loss_val.item(), loss_dict
-
-    def _apply_asymmetric_ggr(self, l_shared):
+    def _apply_asymmetric_ggr(self, l_shared_scaled):
         """
-            Asymmetric Gradient Guided Routing:
-            1. 获取 Shared Loss 对 z 的原始梯度。
-            2. 从 z.grad 中读取已存在的 Specific 梯度 (Anchor)。
-            3. 根据非对称权重 (Asymmetric Weights) 进行投影修剪。
-            4. 手动回传修剪后的 Shared 梯度。
+        1) Read existing z.grad as anchor gradients (from spec backward).
+        2) Compute g_shared = d(l_shared)/d(z)
+        3) For each modality: g_shared' = g_shared - w_m * proj_{g_spec}(g_shared)
+        4) Backprop modified g_shared' into graph once (fast)
         """
-        features = self.model.features
+        _model = self._unwrap_model()
+
+        features = getattr(_model, 'features', None)
+        if not isinstance(features, dict) or len(features) == 0:
+            return
+
         anchor_weights = {
             'pose': 1.0,
             'rgb': 0.2,
@@ -122,37 +143,42 @@ class Solver:
             'depth': 0.2
         }
 
+        z_list = []
+        grad_list = []
+
         for modality, z in features.items():
-            # Step 1: 计算 Shared 任务对 z 的梯度
-            g_shared = torch.autograd.grad(l_shared, z, retain_graph=True, allow_unused=True)[0]
-            if g_shared is None: continue
+            g_shared = torch.autograd.grad(l_shared_scaled, z, retain_graph=True, allow_unused=True)[0]
+            if g_shared is None:
+                continue
 
-            # Step 2: 获取 Anchor 梯度 (来自 Stage A)
-            # z.grad 目前包含的是 \nabla_{spec}
-            if z.grad is None:
-                g_spec = torch.zeros_like(g_shared)
-            else:
-                g_spec = z.grad.clone()  # Clone 出来作为几何参考，不修改原梯度
+            g_spec = z.grad.detach().clone() if z.grad is not None else torch.zeros_like(g_shared)
 
-            # Step 3: 非对称正交投影
-            weight = anchor_weights.get(modality, 0.2)
-
-            if weight > 0:
+            w = float(anchor_weights.get(modality, 0.2))
+            if w > 0.0:
+                # projection of g_shared onto g_spec
                 g_s_flat = g_shared.view(g_shared.size(0), -1)
                 g_p_flat = g_spec.view(g_spec.size(0), -1)
 
                 dot = (g_s_flat * g_p_flat).sum(dim=1, keepdim=True)
                 norm_sq = (g_p_flat * g_p_flat).sum(dim=1, keepdim=True) + 1e-8
+                proj = (dot / norm_sq) * g_p_flat  # (B, Dflat)
 
-                # 投影分量 (冗余部分)
-                proj = (dot / norm_sq).view(-1, 1) * g_spec
-
-                # 软修剪: 只切除 weight * proj
-                g_shared_modified = g_shared - weight * proj
+                proj = proj.view_as(g_shared)
+                g_shared_mod = g_shared - w * proj
             else:
-                g_shared_modified = g_shared
+                g_shared_mod = g_shared
 
-            # Step 4: 回传修剪后的梯度
-            # 注意：这会将 g_shared_modified 累加到 z.grad 上
-            # 最终 z.grad = \nabla_{spec} + \nabla_{shared}'
-            z.backward(g_shared_modified, retain_graph=True)
+            z_list.append(z)
+            grad_list.append(g_shared_mod)
+
+        if len(z_list) > 0:
+            # one backward call (equivalent to per-z backward accumulation)
+            torch.autograd.backward(z_list, grad_list, retain_graph=True)
+
+    def flush_step(self):
+        """
+        Call this at the end of an epoch if you want to avoid dropping the last partial accumulation.
+        """
+        if self.step_count % self.accum_steps != 0:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
