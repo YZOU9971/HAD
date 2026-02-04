@@ -20,7 +20,7 @@ BATCH_SIZE = 4
 ACCUM_STEPS = 8
 # 等效batch_size = 4 * 8 = 32
 EPOCH = 3
-BASE_LR = 1e-4
+BASE_LR = 1e-3
 WEIGHT_DECAY = 1e-4
 MODE = 'base'
 LAMBDA_SPEC = 1.0
@@ -84,7 +84,7 @@ def main():
     print(f"Model Total Params: {model_params_count:.2f} M")
     print(f"Trainable Params:   {trainable_count:.2f} M (Visual Backbones Frozen)")
 
-    optimizer = torch.optim.Adam(trainable_params, lr=0.001, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(trainable_params, lr=BASE_LR, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=1e-6)
 
     solver = Solver(
