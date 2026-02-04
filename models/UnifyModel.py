@@ -172,14 +172,14 @@ class UnifyModel(nn.Module):
         else:
             z_in = [z[m] for m in self.modalities]
 
-        feats_stack = torch.stack(z_in, dim=1)  # (B, M, D)
-        cls_tokens = self.fusion_token.expand(B, -1, -1)  # (B,1,D)
-        fusion_in = torch.cat((cls_tokens, feats_stack), dim=1)  # (B,1+M,D)
+        feats_stack = torch.stack(z_in, dim=1)                                      # (B, M, D)
+        cls_tokens = self.fusion_token.expand(B, -1, -1)                            # (B,1,D)
+        fusion_in = torch.cat((cls_tokens, feats_stack), dim=1)             # (B,1+M,D)
 
         # 4) Add token-wise modality embedding (CLS + each modality token)
-        ids = [self.CLS_ID] + [self.modality_id[m] for m in self.modalities]  # length=1+M
-        token_ids = torch.tensor(ids, device=device).view(1, -1).expand(B, -1)  # (B,1+M)
-        fusion_in = fusion_in + self.modal_embed_table(token_ids)  # (B,1+M,D)
+        ids = [self.CLS_ID] + [self.modality_id[m] for m in self.modalities]        # length=1+M
+        token_ids = torch.tensor(ids, device=device).view(1, -1).expand(B, -1)      # (B,1+M)
+        fusion_in = fusion_in + self.modal_embed_table(token_ids)                   # (B,1+M,D)
 
         # 5) Shared fusion + head
         fusion_out = self.fusion_enc(fusion_in)

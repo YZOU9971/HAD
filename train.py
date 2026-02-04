@@ -1,7 +1,6 @@
 import time
 import os
 import torch
-import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -9,32 +8,37 @@ from data.dataset import get_dataset
 from models.UnifyModel import UnifyModel
 from models.solver import Solver
 
+# -------------------------
+# Config
+# -------------------------
 args = {
     'benchmark': 'xsub',
-    'modalities': ['rgb', 'pose', 'depth', 'ir'],
-    # 'modalities': ['pose'],
+    'modalities': ['rgb', 'pose', 'depth', 'ir'],  # e.g., ['pose'] or ['rgb','pose']
     'num_frames': 32,
     'use_val': True
 }
+
 BATCH_SIZE = 4
 ACCUM_STEPS = 8
-# 等效batch_size = 4 * 8 = 32
 EPOCH = 3
 BASE_LR = 1e-3
 WEIGHT_DECAY = 1e-4
-MODE = 'base'
+
+MODE = 'base'   # 'base' | 'DGL' | 'GMD' | 'GGR'
 LAMBDA_SPEC = 1.0
 LAMBDA_ORTH = 0.1
+
 WORK_DIR = 'checkpoints'
 
 
-def get_dataloader(args, BATCH_SIZE):
+# -------------------------
+# Data
+# -------------------------
+def get_dataloader(args, batch_size):
     train_set = get_dataset('NTU120', 'train', args)
-    # train_set = get_dataset('PKUMMD', 'train', args)
-    # train_set = get_dataset('NUCLA', 'train', args)
     train_loader = DataLoader(
         train_set,
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -42,14 +46,13 @@ def get_dataloader(args, BATCH_SIZE):
         persistent_workers=True,
         drop_last=True
     )
+
     val_loader = None
-    if args['use_val']:
-        # 通常 NTU 的验证集 split 叫 'test' 或 'val'，根据你的 dataset.py 实现调整
-        # 这里假设是 'test' (标准 Cross-Subject/View 测试集)
+    if args.get('use_val', False):
         val_set = get_dataset('NTU120', 'test', args)
         val_loader = DataLoader(
             val_set,
-            batch_size=BATCH_SIZE,  # 验证集不需要梯度累积，BS=4 即可
+            batch_size=batch_size,
             shuffle=False,
             num_workers=4,
             pin_memory=True
@@ -57,37 +60,66 @@ def get_dataloader(args, BATCH_SIZE):
     return train_loader, val_loader
 
 
+# -------------------------
+# Metrics
+# -------------------------
+@torch.no_grad()
 def accuracy(output, target, topk=(1,)):
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+def build_inputs_from_batch(batch, device, modalities):
+    """
+    Return kwargs for UnifyModel.forward: x_rgb/x_ir/x_depth/x_pose
+    Compatible with modality subsets. Expects batch keys are modality names.
+    """
+    inputs = {}
+    # UnifyModel.forward expects keys: x_rgb, x_ir, x_depth, x_pose
+    key_map = {'rgb': 'x_rgb', 'ir': 'x_ir', 'depth': 'x_depth', 'pose': 'x_pose'}
+
+    for m in modalities:
+        if m not in batch:
+            raise KeyError(f"Batch missing modality '{m}'. Available keys: {list(batch.keys())}")
+        inputs[key_map[m]] = batch[m].to(device, non_blocking=True)
+
+    return inputs
 
 
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
+    print("1")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    modalities = args['modalities']
+
     print(f"Start Training | Device: {device} | Mode: {MODE}")
+    print(f"Modalities: {modalities}")
     print(f"Physical Batch: {BATCH_SIZE} | Accumulation: {ACCUM_STEPS} | Effective Batch: {BATCH_SIZE * ACCUM_STEPS}")
 
-    model = UnifyModel(num_classes=120).to(device)
+    # 1) Build model with modality subset
+    model = UnifyModel(num_classes=120, modalities=tuple(modalities)).to(device)
 
+    # 2) Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     model_params_count = sum(p.numel() for p in model.parameters()) / 1e6
     trainable_count = sum(p.numel() for p in trainable_params) / 1e6
     print(f"Model Total Params: {model_params_count:.2f} M")
-    print(f"Trainable Params:   {trainable_count:.2f} M (Visual Backbones Frozen)")
+    print(f"Trainable Params:   {trainable_count:.2f} M (Frozen visual backbones if used)")
 
     optimizer = torch.optim.Adam(trainable_params, lr=BASE_LR, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=1e-6)
 
+    # 3) Solver
     solver = Solver(
         model,
         optimizer,
@@ -97,6 +129,7 @@ def main():
         accum_steps=ACCUM_STEPS
     )
 
+    # 4) Data
     train_loader, val_loader = get_dataloader(args, BATCH_SIZE)
     print(f"Data Ready. Train Batches: {len(train_loader)}")
     if val_loader:
@@ -108,13 +141,12 @@ def main():
     for epoch in range(1, EPOCH + 1):
         model.train()
         start = time.time()
-        total_loss = 0
+        total_loss = 0.0
 
         print(f"\n=== Epoch {epoch}/{EPOCH} ===")
 
         for i, batch in enumerate(train_loader):
             loss_val, loss_dict = solver.train_step(batch, device)
-
             total_loss += loss_val
             global_step += 1
 
@@ -123,22 +155,25 @@ def main():
 
                 if 'shared' in loss_dict:
                     log_str += f" | Shared: {loss_dict['shared']:.4f}"
-
                 if 'orth' in loss_dict and MODE == 'GGR':
                     log_str += f" | Orth: {loss_dict['orth']:.4f}"
 
-                for k in ['rgb', 'pose', 'depth', 'ir']:
-                    if k in loss_dict:
-                        log_str += f" | {k}: {loss_dict[k]:.4f}"
+                # Print per-modality losses only for active modalities
+                for m in modalities:
+                    if m in loss_dict:
+                        log_str += f" | {m}: {loss_dict[m]:.4f}"
 
                 print(log_str)
 
         scheduler.step()
-        avg_loss = total_loss / len(train_loader)
+        avg_loss = total_loss / max(1, len(train_loader))
         epoch_time = (time.time() - start) / 60
         print(f"Epoch {epoch} Finished. Avg Loss: {avg_loss:.4f}. Time: {epoch_time:.1f} min")
 
-        if args['use_val'] and val_loader is not None:
+        # -------------------------
+        # Validation
+        # -------------------------
+        if args.get('use_val', False) and val_loader is not None:
             print("Running Validation...")
             model.eval()
 
@@ -148,24 +183,22 @@ def main():
 
             with torch.no_grad():
                 for batch in val_loader:
-                    x_rgb = batch['rgb'].to(device)
-                    x_ir = batch['ir'].to(device)
-                    x_depth = batch['depth'].to(device)
-                    x_pose = batch['pose'].to(device)
-                    targets = batch['label'].to(device)
+                    targets = batch['label'].to(device, non_blocking=True)
+                    inputs = build_inputs_from_batch(batch, device, modalities)
 
-                    logits_shared, _ = model(x_rgb, x_ir, x_depth, x_pose, gradient_control=MODE)
+                    # Use the same ctrl as training mode
+                    logits_shared, _ = model(**inputs, gradient_control=MODE)
 
                     acc1, acc5 = accuracy(logits_shared, targets, topk=(1, 5))
                     top1_acc_avg += acc1.item()
                     top5_acc_avg += acc5.item()
 
-            top1_acc_avg /= total_batches
-            top5_acc_avg /= total_batches
+            top1_acc_avg /= max(1, total_batches)
+            top5_acc_avg /= max(1, total_batches)
 
             print(f"Val Result: Top-1: {top1_acc_avg:.2f}% | Top-5: {top5_acc_avg:.2f}%")
 
-            # --- Save Best Model ---
+            # Save best model
             if top1_acc_avg > best_acc:
                 best_acc = top1_acc_avg
                 save_path = os.path.join(WORK_DIR, 'best_model.pth')
@@ -174,13 +207,25 @@ def main():
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'best_acc': best_acc,
+                    'mode': MODE,
+                    'modalities': modalities,
+                    'args': args,
                 }, save_path)
                 print(f"🔥 New Best Accuracy! Model saved to {save_path}")
 
-        # 定期保存 checkpoint (防止意外中断)
+        # Periodic checkpoint
         if epoch % 2 == 0:
-            torch.save(model.state_dict(), os.path.join(WORK_DIR, f'epoch_{epoch}.pth'))
+            ckpt_path = os.path.join(WORK_DIR, f'epoch_{epoch}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'mode': MODE,
+                'modalities': modalities,
+                'args': args,
+            }, ckpt_path)
+
+    print(f"Training done. Best Top-1: {best_acc:.2f}% | Mode={MODE} | Modalities={modalities}")
 
 if __name__ == '__main__':
     main()
-
