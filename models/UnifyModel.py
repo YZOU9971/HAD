@@ -1,6 +1,4 @@
 import torch
-from data.dataset import get_dataset
-from torch.utils.data import DataLoader
 import torch.nn as nn
 
 from models.CTR_GCN.CTR_GCN import CTR_GCN_Model
@@ -8,18 +6,31 @@ from models.omnivore import omnivore_swinB
 
 
 class UnifyModel(nn.Module):
+    """
+    Compatible with arbitrary modality subsets.
+
+    - modalities: list of strings in {'rgb','ir','depth','pose'}
+    - forward expects inputs for all modalities, but will only use those in `modalities`.
+      You can pass None for unused modalities.
+    """
+    ALL_MODALITIES = ['rgb', 'ir', 'depth', 'pose']
+
     def __init__(self,
-                 num_classes=60,
+                 num_classes=120,
                  embed_dim=512,
                  fusion_depth=2,
                  fusion_heads=8,
-                 drop_rate=0.1):
+                 drop_rate=0.1,
+                 modalities=('rgb', 'ir', 'depth', 'pose'),):
         super().__init__()
 
-        # ==============================
-        # 1. Unimodal Backbone Encoders
-        # ==============================
-        print("Building Backbones...")
+        self.modalities = tuple(modalities)
+        assert len(self.modalities) >= 1, "Modalities must be non-empty."
+        for m in self.modalities:
+            assert m in self.ALL_MODALITIES, f"Unknown modality: {m}."
+
+        print(f"Building Backbones... modalities={self.modalities}")
+
         CTR_GCN_params = {
             'num_class': num_classes,
             'num_point': 25,
@@ -29,53 +40,53 @@ class UnifyModel(nn.Module):
             'adaptive': True,
             'backbone_only': True
         }
+
         self.swin_out_dim = 1024
         self.gcn_out_dim = 256
 
-        # Omnivore backbones (will be frozen)
+        # Encoders
+        # (RGB/IR/Depth are frozen)
         self.enc_rgb = omnivore_swinB(pretrained=True, load_heads=False)
         self.enc_ir = omnivore_swinB(pretrained=True, load_heads=False)
         self.enc_depth = omnivore_swinB(pretrained=True, load_heads=False)
-
-        # Pose backbone (kept trainable as Strong Anchor)
+        # Pose encoder is trainable (strong anchor)
         self.enc_pose = CTR_GCN_Model(**CTR_GCN_params)
 
-        # ==============================
-        # 2. Projection Layers
-        # ==============================
-        self.proj_rgb = nn.Sequential(nn.Linear(self.swin_out_dim, embed_dim), nn.LayerNorm(embed_dim), nn.GELU())
-        self.proj_ir = nn.Sequential(nn.Linear(self.swin_out_dim, embed_dim), nn.LayerNorm(embed_dim), nn.GELU())
-        self.proj_depth = nn.Sequential(nn.Linear(self.swin_out_dim, embed_dim), nn.LayerNorm(embed_dim), nn.GELU())
-        self.proj_pose = nn.Sequential(
-            nn.Linear(self.gcn_out_dim, embed_dim),
-            nn.BatchNorm1d(embed_dim),
-            nn.GELU()
-        )
+        # Projectors (unified via ModuleDict)
+        self.projector = nn.ModuleDict({
+            'rgb': nn.Sequential(nn.Linear(self.swin_out_dim, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()),
+            'ir': nn.Sequential(nn.Linear(self.swin_out_dim, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()),
+            'depth': nn.Sequential(nn.Linear(self.swin_out_dim, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()),
+            'pose': nn.Sequential(nn.Linear(self.gcn_out_dim, embed_dim), nn.BatchNorm1d(embed_dim), nn.GELU()),
+        })
 
-        # ==============================
-        # 3. Specific Heads (Auxiliary Supervision)
-        # ==============================
-        # These provide the source of \nabla_{spec}
-        self.head_spec_rgb = nn.Linear(embed_dim, num_classes)
-        self.head_spec_ir = nn.Linear(embed_dim, num_classes)
-        self.head_spec_depth = nn.Linear(embed_dim, num_classes)
-        self.head_spec_pose = nn.Linear(embed_dim, num_classes)
+        # Specific heads
+        self.head_spec = nn.ModuleDict({
+            'rgb': nn.Linear(embed_dim, num_classes),
+            'ir': nn.Linear(embed_dim, num_classes),
+            'depth': nn.Linear(embed_dim, num_classes),
+            'pose': nn.Linear(embed_dim, num_classes),
+        })
 
-        # ==============================
-        # 4. Fusion Module (Shared)
-        # ==============================
+        # Fusion (shared)
         self.fusion_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.modal_embed = nn.Parameter(torch.randn(1, 5, embed_dim) * 0.02)
+
+        # Modality embeddings: one per modality token + (optional) CLS embedding
+        # Using a dict-like embedding table to avoid length mismatch.
+        self.modality_id = {m: i for i, m in enumerate(self.ALL_MODALITIES)}
+        self.modal_embed_table = nn.Embedding(len(self.ALL_MODALITIES) + 1, embed_dim)  # +1 for CLS id
+        self.CLS_ID = len(self.ALL_MODALITIES)
 
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=fusion_heads, dim_feedforward=embed_dim * 4,
-            dropout=drop_rate, activation='gelu', batch_first=True
+            d_model=embed_dim, nhead=fusion_heads,
+            dim_feedforward=embed_dim * 4, dropout=drop_rate,
+            activation='gelu', batch_first=True
         )
         self.fusion_enc = nn.TransformerEncoder(enc_layer, num_layers=fusion_depth)
         self.head_shared = nn.Linear(embed_dim, num_classes)
 
-        self.features = {}
-        # Used to store z_shared for L_orth calculation
+        # For Solver (especially GGR)
+        self.features = {}  # dict: modality -> z_m (only used modalities)
         self.z_shared = None
 
         self._init_weights()
@@ -83,86 +94,96 @@ class UnifyModel(nn.Module):
 
     def _init_weights(self):
         print("Initializing weights...")
-        for m in [self.fusion_token, self.modal_embed]:
-            nn.init.trunc_normal_(m, std=0.02)
+        nn.init.trunc_normal_(self.fusion_token, std=0.02)
+        nn.init.trunc_normal_(self.modal_embed_table.weight, std=0.02)
 
-        modules_to_init = [
-            self.proj_rgb, self.proj_ir, self.proj_depth, self.proj_pose,
-            self.head_spec_rgb, self.head_spec_ir, self.head_spec_depth, self.head_spec_pose,
-            self.fusion_enc, self.head_shared
-        ]
+        # init projectors + heads + fusion + shared head
+        modules_to_init = list(self.projector.values()) + list(self.head_spec.values()) + [self.fusion_enc,
+                                                                                           self.head_shared]
         for module in modules_to_init:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.trunc_normal_(m.weight, std=0.02)
-                    if m.bias is not None: nn.init.constant_(m.bias, 0)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
                 elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d)):
                     nn.init.constant_(m.bias, 0)
                     nn.init.constant_(m.weight, 1.0)
 
     def _freeze_backbones(self):
         print('Freezing Omnivore backbones (RGB/IR/Depth)...')
-        # Only freeze visual backbones, Pose is kept trainable
         for module in [self.enc_rgb, self.enc_ir, self.enc_depth]:
-            for param in module.parameters():
-                param.requires_grad = False
+            for p in module.parameters():
+                p.requires_grad = False
 
     def train(self, mode=True):
         super().train(mode)
-        # Keep frozen backbones in eval mode (especially for BN)
+        # keep frozen backbones in eval mode (BN/dropout stability)
         self.enc_rgb.eval()
         self.enc_ir.eval()
         self.enc_depth.eval()
-        # Pose backbone follows the global train/eval mode
 
-    def forward(self, x_rgb, x_ir, x_depth, x_pose, gradient_control='base'):
-        B = x_rgb.shape[0]
+    def _encode_one(self, modality, x):
+        """Encode one modality -> feature vector."""
+        if modality in ('rgb', 'ir', 'depth'):
+            # frozen encoder, no graph
+            with torch.no_grad():
+                if modality == 'rgb':
+                    return self.enc_rgb(x)
+                if modality == 'ir':
+                    return self.enc_ir(x)
+                return self.enc_depth(x)
+        else:
+            # pose is trainable
+            return self.enc_pose(x)
 
-        # Phase 1: Encoding
-        with torch.no_grad():
-            f_rgb = self.enc_rgb(x_rgb)
-            f_ir = self.enc_ir(x_ir)
-            f_depth = self.enc_depth(x_depth)
-        f_pose = self.enc_pose(x_pose)
+    def forward(self, x_rgb=None, x_ir=None, x_depth=None, x_pose=None, gradient_control='base'):
+        # gather inputs
+        x_map = {'rgb': x_rgb, 'ir': x_ir, 'depth': x_depth, 'pose': x_pose}
+        # sanity: required modalities must be provided
+        for m in self.modalities:
+            if x_map[m] is None:
+                raise ValueError(f"Input for modality '{m}' is None but required by model.modalities={self.modalities}")
 
-        # Phase 2: Projection
-        z_rgb = self.proj_rgb(f_rgb)
-        z_ir = self.proj_ir(f_ir)
-        z_depth = self.proj_depth(f_depth)
-        z_pose = self.proj_pose(f_pose)
+        # Batch size from first used modality
+        B = x_map[self.modalities[0]].shape[0]
+        device = x_map[self.modalities[0]].device
 
-        self.features = {'rgb': z_rgb, 'ir': z_ir, 'depth': z_depth, 'pose': z_pose}
+        # 1) Encode + Project only used modalities
+        z = {}
+        for m in self.modalities:
+            f_m = self._encode_one(m, x_map[m])
+            z[m] = self.projector[m](f_m)
 
-        if gradient_control in ['GMD', 'GGR']:
-            for v in self.features.values():
+        # store for Solver
+        self.features = z
+
+        # retain grad only for GGR (Solver reads z.grad as anchor)
+        if gradient_control == 'GGR':
+            for v in z.values():
                 v.retain_grad()
 
-        # Phase 3: Specific Heads (The Source of Anchor Gradients)
-        logits_spec = {
-            'rgb': self.head_spec_rgb(z_rgb),
-            'ir': self.head_spec_ir(z_ir),
-            'depth': self.head_spec_depth(z_depth),
-            'pose': self.head_spec_pose(z_pose)
-        }
+        # 2) Specific heads (only for used modalities)
+        logits_spec = {m: self.head_spec[m](z[m]) for m in self.modalities}
 
-        # Phase 4: Fusion Input
+        # 3) Fusion inputs (order = self.modalities)
         if gradient_control == 'DGL':
-            z_in = [v.detach() for v in [z_rgb, z_ir, z_depth, z_pose]]
+            z_in = [z[m].detach() for m in self.modalities]
         else:
-            z_in = [z_rgb, z_ir, z_depth, z_pose]
+            z_in = [z[m] for m in self.modalities]
 
-        # Phase 5: Shared Fusion
-        feats_stack = torch.stack(z_in, dim=1)
-        cls_tokens = self.fusion_token.expand(B, -1, -1)
-        fusion_in = torch.cat((cls_tokens, feats_stack), dim=1)
-        fusion_in = fusion_in + self.modal_embed
+        feats_stack = torch.stack(z_in, dim=1)  # (B, M, D)
+        cls_tokens = self.fusion_token.expand(B, -1, -1)  # (B,1,D)
+        fusion_in = torch.cat((cls_tokens, feats_stack), dim=1)  # (B,1+M,D)
 
+        # 4) Add token-wise modality embedding (CLS + each modality token)
+        ids = [self.CLS_ID] + [self.modality_id[m] for m in self.modalities]  # length=1+M
+        token_ids = torch.tensor(ids, device=device).view(1, -1).expand(B, -1)  # (B,1+M)
+        fusion_in = fusion_in + self.modal_embed_table(token_ids)  # (B,1+M,D)
+
+        # 5) Shared fusion + head
         fusion_out = self.fusion_enc(fusion_in)
-        z_shared = fusion_out[:, 0, :]
-
-        # 🟢 CRITICAL: Store z_shared for L_orth in Solver
-        self.z_shared = z_shared
-
-        logits_shared = self.head_shared(z_shared)
+        self.z_shared = fusion_out[:, 0, :]
+        logits_shared = self.head_shared(self.z_shared)
 
         return logits_shared, logits_spec
