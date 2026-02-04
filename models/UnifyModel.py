@@ -119,9 +119,10 @@ class UnifyModel(nn.Module):
         B = x_rgb.shape[0]
 
         # Phase 1: Encoding
-        f_rgb = self.enc_rgb(x_rgb)
-        f_ir = self.enc_ir(x_ir)
-        f_depth = self.enc_depth(x_depth)
+        with torch.no_grad():
+            f_rgb = self.enc_rgb(x_rgb)
+            f_ir = self.enc_ir(x_ir)
+            f_depth = self.enc_depth(x_depth)
         f_pose = self.enc_pose(x_pose)
 
         # Phase 2: Projection
