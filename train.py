@@ -1,6 +1,8 @@
 import time
 import os
 import torch
+import random
+import numpy as np
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -24,11 +26,24 @@ EPOCH = 3
 BASE_LR = 1e-3
 WEIGHT_DECAY = 1e-4
 
-MODE = 'base'   # 'base' | 'DGL' | 'GMD' | 'GGR'
+MODE = 'base'
+# 'base' | 'DGL' | 'GMD' | 'GGR'
 LAMBDA_SPEC = 1.0
 LAMBDA_ORTH = 0.1
 
 WORK_DIR = 'checkpoints'
+SEED = 42
+
+# -------------------------
+# Utils
+# -------------------------
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # -------------------------
@@ -97,10 +112,12 @@ def build_inputs_from_batch(batch, device, modalities):
 
 
 def main():
+    seed_everything(SEED)
+
     os.makedirs(WORK_DIR, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    modalities = args['modalities']
 
+    modalities = args['modalities']
     print(f"Start Training | Device: {device} | Mode: {MODE}")
     print(f"Modalities: {modalities}")
     print(f"Physical Batch: {BATCH_SIZE} | Accumulation: {ACCUM_STEPS} | Effective Batch: {BATCH_SIZE * ACCUM_STEPS}")
@@ -134,7 +151,8 @@ def main():
     if val_loader:
         print(f"            Val Batches:   {len(val_loader)}")
 
-    global_step = 0
+    micro_step = 0  # counts dataloader iterations
+    update_step = 0  # counts optimizer updates (every ACCUM_STEPS)
     best_acc = 0.0
 
     for epoch in range(1, EPOCH + 1):
@@ -147,10 +165,13 @@ def main():
         for i, batch in enumerate(train_loader):
             loss_val, loss_dict = solver.train_step(batch, device)
             total_loss += loss_val
-            global_step += 1
+            micro_step += 1
+
+            if solver.step_count % ACCUM_STEPS == 0:
+                update_step += 1
 
             if i % 10 == 0:
-                log_str = f"Iter {global_step} | Total: {loss_val:.4f}"
+                log_str = f"Micro {micro_step} | Update {update_step} | Total: {loss_val:.4f}"
 
                 if 'shared' in loss_dict:
                     log_str += f" | Shared: {loss_dict['shared']:.4f}"
@@ -163,7 +184,8 @@ def main():
                         log_str += f" | {m}: {loss_dict[m]:.4f}"
 
                 print(log_str)
-                solver.flush_step()
+
+        solver.flush_step()
 
         scheduler.step()
         avg_loss = total_loss / max(1, len(train_loader))
@@ -187,7 +209,7 @@ def main():
                     inputs = build_inputs_from_batch(batch, device, modalities)
 
                     # Use the same ctrl as training mode
-                    logits_shared, _ = model(**inputs, gradient_control=MODE)
+                    logits_shared, _ = model(**inputs, gradient_control='base')
 
                     acc1, acc5 = accuracy(logits_shared, targets, topk=(1, 5))
                     top1_acc_avg += acc1.item()
