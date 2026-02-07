@@ -50,7 +50,7 @@ class Solver:
     def _compute_warmup_steps(self):
         if self.steps_per_epoch is None or self.warmup_steps <= 0:
             return 0
-        return int(self.warmup_steps * self.accum_steps)
+        return int(self.steps_per_epoch * self.warmup_epochs)
 
     def _build_inputs_from_batch(self, batch, device):
         """
