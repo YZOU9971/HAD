@@ -5,7 +5,17 @@ from models.GMDtools import GMD
 
 
 class Solver:
-    def __init__(self, model, optimizer, mode='base', lambda_spec=1.0, lambda_orth=0.1, accum_steps=1):
+    def __init__(
+            self,
+            model,
+            optimizer,
+            mode='base',
+            lambda_spec=1.0,
+            lambda_orth=0.1,
+            accum_steps=1,
+            warmup_epochs=1,
+            steps_per_epoch=None,
+    ):
         self.model = model
         self.mode = str(mode).upper()  # normalize
         self.lambda_spec = float(lambda_spec)
@@ -13,8 +23,10 @@ class Solver:
         self.accum_steps = int(accum_steps)
         self.criterion = nn.CrossEntropyLoss()
         self.step_count = 0
+        self.warmup_epochs = int(warmup_epochs)
+        self.steps_per_epoch = steps_per_epoch
+        self.warmup_steps = self._compute_warmup_steps()
 
-        self.warmup_steps = 100
         self.anchor_decay = 0.9
         self.anchor_ema = {}
         self.grad_norm_ema = {}
@@ -34,6 +46,11 @@ class Solver:
 
     def _unwrap_model(self):
         return self.model.module if hasattr(self.model, 'module') else self.model
+
+    def _compute_warmup_steps(self):
+        if self.steps_per_epoch is None or self.warmup_steps <= 0:
+            return 0
+        return int(self.warmup_steps * self.accum_steps)
 
     def _build_inputs_from_batch(self, batch, device):
         """
@@ -204,7 +221,7 @@ class Solver:
             elif z.grad is not None:
                 g_spec = F.normalize(z.grad.detach().flatten(1), dim=1).view_as(g_shared)
             else:
-                g_spec = z.grad.detach().clone() if z.grad is not None else torch.zeros_like(g_shared)
+                g_spec = torch.zeros_like(g_shared)
 
             w = float(anchor_weights.get(modality, 0.2))
             if w > 0.0:

@@ -5,6 +5,7 @@ import random
 import numpy as np
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
 
 from data.dataset import get_dataset
 from models.UnifyModel import UnifyModel
@@ -26,10 +27,11 @@ EPOCH = 3
 BASE_LR = 1e-3
 WEIGHT_DECAY = 1e-4
 
-MODE = 'base'
+MODE = 'GGR'
 # 'base' | 'DGL' | 'GMD' | 'GGR'
 LAMBDA_SPEC = 1.0
 LAMBDA_ORTH = 0.1
+WARMUP_EPOCHS = 1
 
 WORK_DIR = 'checkpoints'
 SEED = 42
@@ -135,21 +137,23 @@ def main():
     optimizer = torch.optim.Adam(trainable_params, lr=BASE_LR, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=1e-6)
 
-    # 3) Solver
+    # 3) Data
+    train_loader, val_loader = get_dataloader(args, BATCH_SIZE)
+    print(f"Data Ready. Train Batches: {len(train_loader)}")
+    if val_loader:
+        print(f"            Val Batches:   {len(val_loader)}")
+
+    # 4) Solver
     solver = Solver(
         model,
         optimizer,
         mode=MODE,
         lambda_spec=LAMBDA_SPEC,
         lambda_orth=LAMBDA_ORTH,
-        accum_steps=ACCUM_STEPS
+        accum_steps=ACCUM_STEPS,
+        warmup_epochs=WARMUP_EPOCHS,
+        steps_per_epoch=len(train_loader)
     )
-
-    # 4) Data
-    train_loader, val_loader = get_dataloader(args, BATCH_SIZE)
-    print(f"Data Ready. Train Batches: {len(train_loader)}")
-    if val_loader:
-        print(f"            Val Batches:   {len(val_loader)}")
 
     micro_step = 0  # counts dataloader iterations
     update_step = 0  # counts optimizer updates (every ACCUM_STEPS)
@@ -204,7 +208,7 @@ def main():
             total_batches = len(val_loader)
 
             with torch.no_grad():
-                for batch in val_loader:
+                for batch in tqdm(val_loader, desc="Validating", leave=False):
                     targets = batch['label'].to(device, non_blocking=True)
                     inputs = build_inputs_from_batch(batch, device, modalities)
 
