@@ -14,6 +14,17 @@ class Solver:
         self.criterion = nn.CrossEntropyLoss()
         self.step_count = 0
 
+        self.warmup_steps = 100
+        self.anchor_decay = 0.9
+        self.anchor_ema = {}
+        self.grad_norm_ema = {}
+        self.anchor_weights = {
+            'pose': 1.0,
+            'rgb': 0.2,
+            'ir': 0.2,
+            'depth': 0.2
+        }
+
         if self.mode == 'GMD':
             self.optimizer = GMD(optimizer, reduction='mean')
         else:
@@ -68,7 +79,9 @@ class Solver:
             total_spec_loss.backward(retain_graph=True)
 
             # (2) Apply asymmetric routing to shared gradients (feature-level)
-            self._apply_asymmetric_ggr(l_shared_scaled)
+            self._update_anchor_ema()
+            anchor_weights = self._get_anchor_weights()
+            self._apply_asymmetric_ggr(l_shared_scaled, anchor_weights)
 
             # (3) Correlation penalty between z_shared and modality features (named orth in your code)
             _model = self._unwrap_model()
@@ -76,8 +89,9 @@ class Solver:
 
             if hasattr(_model, 'z_shared') and hasattr(_model, 'features'):
                 z_s = _model.z_shared
+                z_s = F.normalize(z_s, dim=1)
                 for z_p in _model.features.values():
-                    l_orth = l_orth + F.cosine_similarity(z_s, z_p, dim=1).abs().mean()
+                    l_orth = l_orth + (z_s * z_p).sum(dim=1).pow(2).mean()
 
             loss_dict['orth'] = l_orth.item()
             (l_orth * self.lambda_orth / self.accum_steps).backward()
@@ -123,7 +137,48 @@ class Solver:
 
         return total_loss_val.item(), loss_dict
 
-    def _apply_asymmetric_ggr(self, l_shared_scaled):
+    def _update_anchor_ema(self):
+        _model = self._unwrap_model()
+        features = getattr(_model, 'features', None)
+        if not isinstance(features, dict) or len(features) == 0:
+            return
+
+        for modality, z in features.items():
+            if z.grad is None:
+                continue
+
+            grad = z.grad.detach()
+            grad_flat = grad.flatten(1)
+            grad_dir_flat = F.normalize(grad_flat, dim=1)
+            grad_dir = grad_dir_flat.view_as(grad)
+            if modality not in self.anchor_ema:
+                self.anchor_ema[modality] = grad_dir.clone()
+            else:
+                self.anchor_ema[modality] = self.anchor_decay * self.anchor_ema[modality] + (
+                            1 - self.anchor_decay) * grad_dir
+
+            grad_norm = grad_flat.norm(p=2, dim=1).mean().item()
+            if modality not in self.grad_norm_ema:
+                self.grad_norm_ema[modality] = grad_norm
+            else:
+                self.grad_norm_ema[modality] = self.anchor_decay * self.grad_norm_ema[modality] + (
+                            1 - self.anchor_decay) * grad_norm
+
+    def _get_anchor_weights(self):
+        if self.step_count < self.warmup_steps or len(self.grad_norm_ema) == 0:
+            return self.anchor_weights
+
+        mean_norm = sum(self.grad_norm_ema.values()) / max(1, len(self.grad_norm_ema))
+        if mean_norm <= 0:
+            return self.anchor_weights
+
+        weights = {}
+        for modality, base_w in self.anchor_weights.items():
+            rel = self.grad_norm_ema.get(modality, mean_norm) / mean_norm
+            weights[modality] = float(base_w * rel)
+        return weights
+
+    def _apply_asymmetric_ggr(self, l_shared_scaled, anchor_weights):
         """
         1) Read existing z.grad as anchor gradients (from spec backward).
         2) Compute g_shared = d(l_shared)/d(z)
@@ -136,13 +191,6 @@ class Solver:
         if not isinstance(features, dict) or len(features) == 0:
             return
 
-        anchor_weights = {
-            'pose': 1.0,
-            'rgb': 0.2,
-            'ir': 0.2,
-            'depth': 0.2
-        }
-
         z_list = []
         grad_list = []
 
@@ -151,7 +199,12 @@ class Solver:
             if g_shared is None:
                 continue
 
-            g_spec = z.grad.detach().clone() if z.grad is not None else torch.zeros_like(g_shared)
+            if modality in self.anchor_ema:
+                g_spec = self.anchor_ema[modality]
+            elif z.grad is not None:
+                g_spec = F.normalize(z.grad.detach().flatten(1), dim=1).view_as(g_shared)
+            else:
+                g_spec = z.grad.detach().clone() if z.grad is not None else torch.zeros_like(g_shared)
 
             w = float(anchor_weights.get(modality, 0.2))
             if w > 0.0:
@@ -159,9 +212,9 @@ class Solver:
                 g_s_flat = g_shared.view(g_shared.size(0), -1)
                 g_p_flat = g_spec.view(g_spec.size(0), -1)
 
+                g_p_flat = F.normalize(g_p_flat, dim=1)
                 dot = (g_s_flat * g_p_flat).sum(dim=1, keepdim=True)
-                norm_sq = (g_p_flat * g_p_flat).sum(dim=1, keepdim=True) + 1e-8
-                proj = (dot / norm_sq) * g_p_flat  # (B, Dflat)
+                proj = dot * g_p_flat  # (B, Dflat)
 
                 proj = proj.view_as(g_shared)
                 g_shared_mod = g_shared - w * proj
