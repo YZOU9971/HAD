@@ -31,6 +31,7 @@ class UnifyModel(nn.Module):
 
         print(f"Building Backbones... modalities={self.modalities}")
 
+        # Encoders
         CTR_GCN_params = {
             'num_class': num_classes,
             'num_point': 25,
@@ -44,11 +45,11 @@ class UnifyModel(nn.Module):
         self.swin_out_dim = 1024
         self.gcn_out_dim = 256
 
-        # Encoders
         # (RGB/IR/Depth are frozen)
         self.enc_rgb = omnivore_swinB(pretrained=True, load_heads=False)
         self.enc_ir = omnivore_swinB(pretrained=True, load_heads=False)
         self.enc_depth = omnivore_swinB(pretrained=True, load_heads=False)
+
         # Pose encoder is trainable (strong anchor)
         self.enc_pose = CTR_GCN_Model(**CTR_GCN_params)
 
@@ -78,16 +79,23 @@ class UnifyModel(nn.Module):
         self.CLS_ID = len(self.ALL_MODALITIES)
 
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=fusion_heads,
-            dim_feedforward=embed_dim * 4, dropout=drop_rate,
-            activation='gelu', batch_first=True
+            d_model=embed_dim,
+            nhead=fusion_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=drop_rate,
+            activation='gelu',
+            batch_first=True
         )
         self.fusion_enc = nn.TransformerEncoder(enc_layer, num_layers=fusion_depth)
         self.head_shared = nn.Linear(embed_dim, num_classes)
 
-        # For Solver (especially GGR)
-        self.features = {}  # dict: modality -> z_m (only used modalities)
-        self.z_shared = None
+        # Runtime caches (used by Solver)
+        self.features = {}  # modality -> z_m (projected)
+        self.z_shared = None  # z_s (CLS output)
+
+        # Optional diagnostics (large tensors)
+        self._fusion_in = None  # (B, 1+M, D)
+        self._token_ids = None  # (B, 1+M)
 
         self._init_weights()
         self._freeze_backbones()
@@ -98,8 +106,8 @@ class UnifyModel(nn.Module):
         nn.init.trunc_normal_(self.modal_embed_table.weight, std=0.02)
 
         # init projectors + heads + fusion + shared head
-        modules_to_init = list(self.projector.values()) + list(self.head_spec.values()) + [self.fusion_enc,
-                                                                                           self.head_shared]
+        modules_to_init = list(self.projector.values()) + list(self.head_spec.values()) + [self.fusion_enc, self.head_shared]
+
         for module in modules_to_init:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
@@ -123,21 +131,39 @@ class UnifyModel(nn.Module):
         self.enc_ir.eval()
         self.enc_depth.eval()
 
+    # Encoding helpers
     def _encode_one(self, modality, x):
         """Encode one modality -> feature vector."""
-        if modality in ('rgb', 'ir', 'depth'):
-            # frozen encoder, no graph
+        if modality == 'rgb':
             with torch.no_grad():
-                if modality == 'rgb':
-                    return self.enc_rgb(x)
-                if modality == 'ir':
-                    return self.enc_ir(x)
+                return self.enc_rgb(x)
+        if modality == 'ir':
+            with torch.no_grad():
+                return self.enc_ir(x)
+        if modality == 'depth':
+            with torch.no_grad():
                 return self.enc_depth(x)
-        else:
-            # pose is trainable
+        if modality == 'pose':
             return self.enc_pose(x)
+        raise ValueError(f"Unknown modality: {modality}")
+
+    def get_fusion_inputs(self):
+        """
+        Returns the last forward fusion input tokens:
+        - fusion_in: (B, 1+M, D)
+        - token_ids: (B, 1+M)
+        Useful for token-level diagnostics.
+        """
+        return self._fusion_in, self._token_ids
 
     def forward(self, x_rgb=None, x_ir=None, x_depth=None, x_pose=None, gradient_control='base'):
+        """
+        gradient_control:
+          - 'base': normal joint training
+          - 'DGL' : detach modality tokens before fusion (stop shared->modality)
+          - 'GMD' : forward same as base; solver uses PCGrad
+          - 'GGR' : forward same as base; solver uses routing/orth/warmup, etc.
+        """
         # gather inputs
         x_map = {'rgb': x_rgb, 'ir': x_ir, 'depth': x_depth, 'pose': x_pose}
         # sanity: required modalities must be provided
@@ -180,6 +206,9 @@ class UnifyModel(nn.Module):
         ids = [self.CLS_ID] + [self.modality_id[m] for m in self.modalities]        # length=1+M
         token_ids = torch.tensor(ids, device=device).view(1, -1).expand(B, -1)      # (B,1+M)
         fusion_in = fusion_in + self.modal_embed_table(token_ids)                   # (B,1+M,D)
+
+        self._fusion_in = fusion_in
+        self._token_ids = token_ids
 
         # 5) Shared fusion + head
         fusion_out = self.fusion_enc(fusion_in)
