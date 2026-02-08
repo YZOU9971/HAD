@@ -207,6 +207,9 @@ class UnifyModel(nn.Module):
         token_ids = torch.tensor(ids, device=device).view(1, -1).expand(B, -1)      # (B,1+M)
         fusion_in = fusion_in + self.modal_embed_table(token_ids)                   # (B,1+M,D)
 
+        if gradient_control == 'GGR':
+            fusion_in.retain_grad()
+
         self._fusion_in = fusion_in
         self._token_ids = token_ids
 

@@ -48,7 +48,7 @@ class Solver:
         return self.model.module if hasattr(self.model, 'module') else self.model
 
     def _compute_warmup_steps(self):
-        if self.steps_per_epoch is None or self.warmup_steps <= 0:
+        if self.steps_per_epoch is None or self.warmup_epochs <= 0:
             return 0
         return int(self.steps_per_epoch * self.warmup_epochs)
 
@@ -95,6 +95,9 @@ class Solver:
             total_spec_loss = sum(l_specs_scaled.values()) * self.lambda_spec
             total_spec_loss.backward(retain_graph=True)
 
+            # (1.5) Update shared head only (avoid affecting shared features)
+            self._backward_shared_head_only(l_shared_scaled)
+
             # (2) Apply asymmetric routing to shared gradients (feature-level)
             self._update_anchor_ema()
             anchor_weights = self._get_anchor_weights()
@@ -108,6 +111,7 @@ class Solver:
                 z_s = _model.z_shared
                 z_s = F.normalize(z_s, dim=1)
                 for z_p in _model.features.values():
+                    z_p = F.normalize(z_p, dim=1)
                     l_orth = l_orth + (z_s * z_p).sum(dim=1).pow(2).mean()
 
             loss_dict['orth'] = l_orth.item()
@@ -154,6 +158,26 @@ class Solver:
 
         return total_loss_val.item(), loss_dict
 
+    def _backward_shared_head_only(self, l_shared_scaled):
+        _model = self._unwrap_model()
+        head = getattr(_model, 'head_shared', None)
+        if head is None:
+            return
+
+        params = [p for p in head.parameters() if p.requires_grad]
+        if not params:
+            return
+
+        grads = torch.autograd.grad(l_shared_scaled, params, retain_graph=True, allow_unused=True)
+        for param, grad in zip(params, grads):
+            if grad is None:
+                continue
+            grad = grad.detach()
+            if param.grad is None:
+                param.grad = grad.clone()
+            else:
+                param.grad.add_(grad)
+
     def _update_anchor_ema(self):
         _model = self._unwrap_model()
         features = getattr(_model, 'features', None)
@@ -172,14 +196,14 @@ class Solver:
                 self.anchor_ema[modality] = grad_dir.clone()
             else:
                 self.anchor_ema[modality] = self.anchor_decay * self.anchor_ema[modality] + (
-                            1 - self.anchor_decay) * grad_dir
+                        1 - self.anchor_decay) * grad_dir
 
             grad_norm = grad_flat.norm(p=2, dim=1).mean().item()
             if modality not in self.grad_norm_ema:
                 self.grad_norm_ema[modality] = grad_norm
             else:
                 self.grad_norm_ema[modality] = self.anchor_decay * self.grad_norm_ema[modality] + (
-                            1 - self.anchor_decay) * grad_norm
+                        1 - self.anchor_decay) * grad_norm
 
     def _get_anchor_weights(self):
         if self.step_count < self.warmup_steps or len(self.grad_norm_ema) == 0:
@@ -197,53 +221,60 @@ class Solver:
 
     def _apply_asymmetric_ggr(self, l_shared_scaled, anchor_weights):
         """
-        1) Read existing z.grad as anchor gradients (from spec backward).
-        2) Compute g_shared = d(l_shared)/d(z)
-        3) For each modality: g_shared' = g_shared - w_m * proj_{g_spec}(g_shared)
-        4) Backprop modified g_shared' into graph once (fast)
+        Route gradients at fusion input token level (fusion_in), so fusion_enc is trained by L_shared.
+
+        1) g_in = d(L_shared)/d(fusion_in) -> (B, 1+M, D)
+        2) For each modality token: g_in[:, t, :] = g_in[:, t, :] - w_m * proj_{g_spec}(g_in[:, t, :])
+        3) Backprop modified g_in into graph once.
         """
         _model = self._unwrap_model()
 
         features = getattr(_model, 'features', None)
-        if not isinstance(features, dict) or len(features) == 0:
+        fusion_in = getattr(_model, '_fusion_in', None)
+
+        if fusion_in is None or not isinstance(features, dict) or len(features) == 0:
             return
 
-        z_list = []
-        grad_list = []
+        g_in = torch.autograd.grad(
+            l_shared_scaled, fusion_in, retain_graph=True, allow_unused=True
+        )[0]
+        if g_in is None:
+            return
 
-        for modality, z in features.items():
-            g_shared = torch.autograd.grad(l_shared_scaled, z, retain_graph=True, allow_unused=True)[0]
-            if g_shared is None:
+        if self.step_count < self.warmup_steps:
+            torch.autograd.backward([fusion_in], [g_in], retain_graph=True)
+            return
+
+        modalities = getattr(_model, 'modalities', None) or list(features.keys())
+        g_in_routed = g_in.clone()
+
+        for idx, modality in enumerate(modalities):
+            token_pos = 1 + idx  # CLS = 0
+            g_tok = g_in_routed[:, token_pos, :]
+
+            z = features.get(modality, None)
+            if z is None:
                 continue
 
             if modality in self.anchor_ema:
                 g_spec = self.anchor_ema[modality]
             elif z.grad is not None:
-                g_spec = F.normalize(z.grad.detach().flatten(1), dim=1).view_as(g_shared)
+                g_spec = z.grad.detach()
             else:
-                g_spec = torch.zeros_like(g_shared)
+                continue
 
             w = float(anchor_weights.get(modality, 0.2))
-            if w > 0.0:
-                # projection of g_shared onto g_spec
-                g_s_flat = g_shared.view(g_shared.size(0), -1)
-                g_p_flat = g_spec.view(g_spec.size(0), -1)
+            if w <= 0.0:
+                continue
 
-                g_p_flat = F.normalize(g_p_flat, dim=1)
-                dot = (g_s_flat * g_p_flat).sum(dim=1, keepdim=True)
-                proj = dot * g_p_flat  # (B, Dflat)
+            g_p = F.normalize(g_spec.view(g_spec.size(0), -1), dim=1)
+            g_s = g_tok.view(g_tok.size(0), -1)
+            dot = (g_s * g_p).sum(dim=1, keepdim=True)
+            proj = dot * g_p
+            g_tok_mod = g_s - w * proj
+            g_in_routed[:, token_pos, :] = g_tok_mod.view_as(g_tok)
 
-                proj = proj.view_as(g_shared)
-                g_shared_mod = g_shared - w * proj
-            else:
-                g_shared_mod = g_shared
-
-            z_list.append(z)
-            grad_list.append(g_shared_mod)
-
-        if len(z_list) > 0:
-            # one backward call (equivalent to per-z backward accumulation)
-            torch.autograd.backward(z_list, grad_list, retain_graph=True)
+        torch.autograd.backward([fusion_in], [g_in_routed], retain_graph=True)
 
     def flush_step(self):
         """

@@ -31,7 +31,7 @@ MODE = 'GGR'
 # 'base' | 'DGL' | 'GMD' | 'GGR'
 LAMBDA_SPEC = 1.0
 LAMBDA_ORTH = 0.1
-WARMUP_EPOCHS = 1
+WARMUP_EPOCHS = 0
 
 WORK_DIR = 'checkpoints'
 SEED = 42
