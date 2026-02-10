@@ -8,7 +8,6 @@ __pycache__/
 *.pth
 checkpoints/
 runs/
-logs/
 
 # dataset
 datasets/
