@@ -17,7 +17,7 @@ def smooth(scalars, weight=0.8):
 # ==========================================
 # 参数设置
 # ==========================================
-file_path = 'attempt6_DGL_3epoch.txt'  # 🟢 修改为你的 log 文件
+file_path = 'base.txt'  # 🟢 修改为你的 log 文件
 smooth_weight = 0.9
 
 # 🟢 [新增]在此处设置左轴固定范围 (最小值, 最大值)
@@ -153,6 +153,7 @@ else:
     # 🟢 [修改] 应用左轴固定范围
     if y_limit_main is not None:
         ax_left.set_ylim(y_limit_main)
+    ax_right.set_ylim((0, 0.1))
 
     ax_right.set_ylabel('Orth Loss', fontsize=12, color='gray')
     ax_left.grid(True, linestyle='--', alpha=0.3)
